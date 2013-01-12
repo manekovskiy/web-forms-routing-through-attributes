@@ -1,0 +1,155 @@
+﻿<#@ template language="C#" debug="true" hostspecific="true" #>
+<#@ output extension=".cs" #>
+<#@ assembly name="System.Core" #>
+<#@ assembly name="Microsoft.VisualStudio.Shell.Interop.8.0" #>
+<#@ assembly name="Microsoft.CSharp" #>
+<#@ assembly name="System.Windows.Forms" #>
+<#@ assembly name="EnvDTE" #>
+<#@ assembly name="EnvDTE80" #>
+<#@ assembly name="VSLangProj" #>
+<#@ assembly name="$(TargetPath)" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Windows.Forms" #>
+<#@ import namespace="System.Text.RegularExpressions" #>
+<#@ import namespace="Microsoft.VisualStudio.Shell.Interop" #>
+<#@ import namespace="EnvDTE" #>
+<#@ import namespace="EnvDTE80" #>
+<#@ import namespace="Microsoft.VisualStudio.TextTemplating" #>
+<#@ import namespace="RoutingWithAttributes" #>
+
+<# 
+// To debug, uncomment the next two lines
+//System.Diagnostics.Debugger.Launch();
+//System.Diagnostics.Debugger.Break();
+#>
+
+<# 
+
+UpdatePhysicalFilePathParameters(); 
+
+#>
+
+<#+
+	private static DTE dte;
+	private Project project;
+
+	public void UpdatePhysicalFilePathParameters()
+	{
+		// Get the DTE service from the host
+		var serviceProvider = Host as IServiceProvider;
+		if (serviceProvider != null) 
+			dte = serviceProvider.GetService(typeof(SDTE)) as DTE;
+
+		// Fail if we couldn't get the DTE. This can happen when trying to run in TextTransform.exe
+		if (dte == null) 
+			throw new Exception("This file can only execute through the Visual Studio host");
+
+		project = GetProjectContainingT4File(dte);
+		if(project.ProjectItems == null)
+			return;
+
+		foreach(ProjectItem projectItem in project.ProjectItems)
+		{
+			IEnumerable<ProjectItem> projectItemsTree = GetProjectItemsTreeRecursive(projectItem);
+
+			foreach (ProjectItem item in projectItemsTree)
+			{
+				FileCodeModel fileCodeModel = item.FileCodeModel;
+					
+				if (fileCodeModel == null || item.FileCount == 0)
+					continue;
+
+				Func<CodeElement, bool> isAttribute = codeElement => codeElement.Kind == vsCMElement.vsCMElementAttribute;
+
+				IEnumerable<CodeElement> attributes = item.FileCodeModel.CodeElements
+					.OfType<CodeElement>()
+					.SelectMany(ce => SearchCodeElementsRecursive(ce, isAttribute));
+
+				foreach (CodeAttribute attribute in attributes)
+				{
+					if(attribute.FullName == typeof(MapToRouteAttribute).FullName)
+					{
+						string newVirtualPath = GetVirtualPathFor(item);
+						if(TryUpdatePhysicalFileAttributeProperty(attribute, newVirtualPath))
+						{
+							Warning(string.Format("{0}: updated MapToRoute.PhysicalFile property with {1} value", Path.GetFileName(item.FileNames[1]), newVirtualPath));
+							item.Save();
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// We just replacing part of absolute path with '~' character and dropping extension of codebehind file
+	private string GetVirtualPathFor(ProjectItem item)
+	{
+		string projectDirectory = Path.GetDirectoryName(item.ContainingProject.FileName);
+		string aspxFile = item.FileNames[1].Replace(".cs", "").Replace(".vb", "");
+		
+		return aspxFile.Replace(projectDirectory, "~").Replace("\\", "/");
+	}
+
+	// All mehtods below this line copied from T4MVC.tt (http://t4mvc.codeplex.com/)
+	private Project GetProjectContainingT4File(DTE dte) {
+		// Find the .tt file's ProjectItem
+		ProjectItem projectItem = dte.Solution.FindProjectItem(Host.TemplateFile);
+
+		// If the .tt file is not opened, open it
+		if (projectItem.Document == null)
+			projectItem.Open(Constants.vsViewKindCode);
+
+		return projectItem.ContainingProject;
+	}
+
+	private bool TryUpdatePhysicalFileAttributeProperty(CodeAttribute codeElement, string valueReplacement)
+	{
+		string oldValue = codeElement.Value;
+
+		Regex replacePhysicalFileValueRegex = new Regex("(?<=PhysicalFile\\s*=\\s*\\\")(?<PhysicalFile>.*)(?=\\\")", 
+														RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.IgnorePatternWhitespace | RegexOptions.Compiled);
+
+		string newValue;
+		if(replacePhysicalFileValueRegex.IsMatch(codeElement.Value))
+		{
+			newValue = replacePhysicalFileValueRegex.Replace(codeElement.Value, valueReplacement);
+		}
+		else 
+		{
+			newValue = string.Format("{0}, PhysicalFile = \"{1}\"", codeElement.Value, valueReplacement);
+		}
+
+		bool changed = !string.Equals(newValue, oldValue, StringComparison.InvariantCultureIgnoreCase);
+
+		if(changed)
+			codeElement.Value = newValue;
+
+		return changed;
+	}
+	
+	private IEnumerable<ProjectItem> GetProjectItemsTreeRecursive(ProjectItem projectItem)
+	{
+		List<ProjectItem> result = new List<ProjectItem>();
+		if(projectItem.ProjectItems.Count == 0)
+			result.Add(projectItem);
+
+		result.AddRange(projectItem.ProjectItems.OfType<ProjectItem>().SelectMany(GetProjectItemsTreeRecursive));
+
+		return result;
+	}
+
+	private IEnumerable<CodeElement> SearchCodeElementsRecursive(CodeElement codeElement, Func<CodeElement, bool> predicate)
+	{
+		List<CodeElement> result = new List<CodeElement>();
+		if (predicate(codeElement))
+			result.Add(codeElement);
+
+		if (codeElement.Children.Count > 0)
+			result.AddRange(codeElement.Children.OfType<CodeElement>().SelectMany(ce => SearchCodeElementsRecursive(ce, predicate)));
+		
+		return result;
+	}
+#>
